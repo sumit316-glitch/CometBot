@@ -19,11 +19,18 @@ import kotlin.math.hypot
 /**
  * Foreground service: floating bubble + screen capture + detector + tap dispatch.
  * Bubble: tap = start/pause, drag = move, long-press = quit.
+ *
+ * Fixes:
+ *  1. FLAG_NOT_TOUCH_MODAL added so banking app's FLAG_SECURE doesn't eat our bubble touch.
+ *  2. Bubble re-added on WindowManager if it was removed by a secure window transition.
+ *  3. Screen-capture stops (active=false) when no frames arrive from a FLAG_SECURE window,
+ *     but the bubble stays visible so you can still tap ON/OFF.
  */
 class BotService : Service() {
 
     private lateinit var wm: WindowManager
     private var bubble: TextView? = null
+    private var bubbleLp: WindowManager.LayoutParams? = null
     private var projection: MediaProjection? = null
     private var vd: VirtualDisplay? = null
     private var reader: ImageReader? = null
@@ -38,6 +45,17 @@ class BotService : Service() {
     private var capH = 1040
     private var scaleX = 1f
     private var scaleY = 1f
+
+    // tracks if bubble was forcibly removed by system (secure window, etc.)
+    private var bubbleAttached = false
+
+    // watchdog: re-attach bubble if it was removed by the system
+    private val bubbleWatchdog = object : Runnable {
+        override fun run() {
+            reattachBubbleIfNeeded()
+            ui.postDelayed(this, 1000)
+        }
+    }
 
     private class Track(var x: Float, var y: Float, var vy: Float, var t: Long, var lastTap: Long)
     private val tracks = ArrayList<Track>()
@@ -59,6 +77,7 @@ class BotService : Service() {
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         startCapture()
         showBubble()
+        ui.postDelayed(bubbleWatchdog, 1000)
         return START_NOT_STICKY
     }
 
@@ -95,11 +114,32 @@ class BotService : Service() {
                 if (!active) return@setOnImageAvailableListener
                 val pl = img.planes[0]
                 val bb = pl.buffer
+                // A FLAG_SECURE screen gives a black/empty frame. Detect it: all bytes ~0.
+                // If so, skip processing (tapping would be pointless, positions are wrong).
+                val isSecure = isBlackFrame(bb)
+                if (isSecure) return@setOnImageAvailableListener
                 if (buf.size != bb.remaining()) buf = ByteArray(bb.remaining())
                 bb.get(buf)
                 process(buf, pl.rowStride)
             } finally { img.close() }
         }, Handler(thread!!.looper))
+    }
+
+    /** Heuristic: a FLAG_SECURE frame is all-black (or very nearly). Sample 200 pixels. */
+    private fun isBlackFrame(bb: java.nio.ByteBuffer): Boolean {
+        val saved = bb.position()
+        val step = maxOf(1, bb.remaining() / 200)
+        var nonBlack = 0
+        var pos = saved
+        while (pos < bb.limit()) {
+            val r = bb.get(pos).toInt() and 0xFF
+            val g = bb.get(pos + 1).toInt() and 0xFF
+            val b = bb.get(pos + 2).toInt() and 0xFF
+            if (r + g + b > 30) { nonBlack++; if (nonBlack > 10) break }
+            pos += step
+        }
+        bb.position(saved)
+        return nonBlack <= 10
     }
 
     private fun process(px: ByteArray, stride: Int) {
@@ -143,6 +183,27 @@ class BotService : Service() {
         (b.background as GradientDrawable).setColor(if (active) 0xCC2E7D32.toInt() else 0xCC455A64.toInt())
     }
 
+    private fun makeLp(size: Int): WindowManager.LayoutParams {
+        val lp = WindowManager.LayoutParams(
+            size, size,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            // FLAG_NOT_TOUCH_MODAL: lets touches outside the bubble pass through to the app
+            // FLAG_NOT_FOCUSABLE:   bubble never steals keyboard focus
+            // FLAG_LAYOUT_NO_LIMITS: can be dragged to screen edges
+            // FLAG_LAYOUT_IN_SCREEN: always in the real screen rect, not behind nav bars
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = resources.displayMetrics.widthPixels - size
+            y = (resources.displayMetrics.heightPixels * 0.55f).toInt()
+        }
+        return lp
+    }
+
     private fun showBubble() {
         val size = (62 * resources.displayMetrics.density).toInt()
         val tv = TextView(this).apply {
@@ -150,20 +211,19 @@ class BotService : Service() {
             background = GradientDrawable().apply { shape = GradientDrawable.OVAL }
         }
         bubble = tv
-        val lp = WindowManager.LayoutParams(size, size,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-            PixelFormat.TRANSLUCENT).apply {
-            gravity = Gravity.TOP or Gravity.START
-            x = resources.displayMetrics.widthPixels - size; y = (resources.displayMetrics.heightPixels * 0.55f).toInt()
-        }
+        val lp = makeLp(size)
+        bubbleLp = lp
         var dx = 0f; var dy = 0f; var sx = 0; var sy = 0; var moved = false; var downT = 0L
         tv.setOnTouchListener { _, e ->
             when (e.action) {
                 MotionEvent.ACTION_DOWN -> { dx = e.rawX; dy = e.rawY; sx = lp.x; sy = lp.y; moved = false; downT = e.eventTime }
                 MotionEvent.ACTION_MOVE -> {
                     if (hypot(e.rawX - dx, e.rawY - dy) > 12) moved = true
-                    if (moved) { lp.x = sx + (e.rawX - dx).toInt(); lp.y = sy + (e.rawY - dy).toInt(); wm.updateViewLayout(tv, lp) }
+                    if (moved) {
+                        lp.x = sx + (e.rawX - dx).toInt()
+                        lp.y = sy + (e.rawY - dy).toInt()
+                        try { wm.updateViewLayout(tv, lp) } catch (_: Exception) {}
+                    }
                 }
                 MotionEvent.ACTION_UP -> if (!moved) {
                     if (e.eventTime - downT > 800) shutdown()
@@ -176,14 +236,48 @@ class BotService : Service() {
             }
             true
         }
-        wm.addView(tv, lp)
+        try {
+            wm.addView(tv, lp)
+            bubbleAttached = true
+        } catch (e: Exception) {
+            bubbleAttached = false
+        }
         refreshBubble()
+    }
+
+    /**
+     * Some banking apps use FLAG_SECURE which can cause the system to forcibly remove
+     * TYPE_APPLICATION_OVERLAY windows. Re-attach the bubble if it got detached.
+     */
+    private fun reattachBubbleIfNeeded() {
+        val tv = bubble ?: return
+        val lp = bubbleLp ?: return
+        if (!bubbleAttached) {
+            try {
+                wm.addView(tv, lp)
+                bubbleAttached = true
+            } catch (_: Exception) {}
+            return
+        }
+        // Check if view is still attached (has a parent)
+        if (tv.windowToken == null) {
+            bubbleAttached = false
+            try {
+                wm.removeViewImmediate(tv)
+            } catch (_: Exception) {}
+            try {
+                wm.addView(tv, lp)
+                bubbleAttached = true
+            } catch (_: Exception) {}
+        }
     }
 
     private fun shutdown() {
         active = false
+        ui.removeCallbacks(bubbleWatchdog)
         try { bubble?.let { wm.removeView(it) } } catch (_: Exception) {}
         bubble = null
+        bubbleAttached = false
         try { vd?.release() } catch (_: Exception) {}
         try { reader?.close() } catch (_: Exception) {}
         try { projection?.stop() } catch (_: Exception) {}

@@ -17,14 +17,8 @@ import android.widget.TextView
 import kotlin.math.hypot
 
 /**
- * Accessibility service: injects taps AND hosts the floating bubble.
- *
- * KEY INSIGHT: TYPE_ACCESSIBILITY_OVERLAY is the ONLY window type that is
- * guaranteed to show over FLAG_SECURE windows (used by banking apps).
- * TYPE_APPLICATION_OVERLAY (used previously) is always hidden by FLAG_SECURE.
- *
- * The bubble lives here; BotService calls showBubble()/updateBubble()/hideBubble()
- * on the singleton instance.
+ * Accessibility service: injects slashes AND hosts the floating bubble.
+ * Uses TYPE_ACCESSIBILITY_OVERLAY so the bubble stays visible over secure banking apps.
  */
 class TapService : AccessibilityService() {
 
@@ -40,7 +34,7 @@ class TapService : AccessibilityService() {
     private var bubbleLp: WindowManager.LayoutParams? = null
     private lateinit var wm: WindowManager
 
-    // Callback set by BotService so bubble taps route back to it
+    // Callbacks set by BotService
     var onBubbleTap: (() -> Unit)? = null
     var onBubbleLongPress: (() -> Unit)? = null
 
@@ -58,32 +52,50 @@ class TapService : AccessibilityService() {
         return super.onUnbind(intent)
     }
 
-    // ── Tap injection ──────────────────────────────────────────────────────────
+    // ── Gesture injection (Real Slashes) ──────────────────────────────────────
 
-    /** Taps all points at (almost) the same moment. Returns false if busy. */
-    fun tap(points: List<FloatArray>): Boolean {
+    /**
+     * Slashes across the target comets.
+     * Slicing games require actual motion (ACTION_MOVE) to register blade cuts.
+     */
+    fun slash(points: List<FloatArray>): Boolean {
         if (points.isEmpty()) return false
         val now = SystemClock.uptimeMillis()
         if (now < busyUntil) return false
+
+        val density = resources.displayMetrics.density.coerceAtLeast(1f)
+        val slashDx = 45f * density
+        val slashDy = 18f * density
+
         val b = GestureDescription.Builder()
-        for ((n, p) in points.take(9).withIndex()) {
-            val path = Path().apply { moveTo(p[0], p[1]) }
-            b.addStroke(GestureDescription.StrokeDescription(path, n * 8L, 20L))
+        for ((n, p) in points.take(4).withIndex()) {
+            val x = p[0]
+            val y = p[1]
+            // Diagonal slash path cutting directly across the comet
+            val path = Path().apply {
+                moveTo(x - slashDx, y + slashDy)
+                lineTo(x + slashDx, y - slashDy)
+            }
+            b.addStroke(GestureDescription.StrokeDescription(path, n * 10L, 35L))
         }
-        busyUntil = now + 250
+
+        busyUntil = now + 70L // Short fallback timeout
         val ok = dispatchGesture(b.build(), object : GestureResultCallback() {
-            override fun onCompleted(g: GestureDescription?) { busyUntil = 0 }
-            override fun onCancelled(g: GestureDescription?) { busyUntil = 0 }
+            override fun onCompleted(g: GestureDescription?) { busyUntil = 0L }
+            override fun onCancelled(g: GestureDescription?) { busyUntil = 0L }
         }, null)
-        if (!ok) busyUntil = 0
+        if (!ok) busyUntil = 0L
         return ok
     }
 
-    // ── Bubble management (called from BotService on main thread) ──────────────
+    /** Backward-compatible alias */
+    fun tap(points: List<FloatArray>): Boolean = slash(points)
+
+    // ── Bubble management (called on main thread) ─────────────────────────────
 
     fun showBubble(onTap: () -> Unit, onLongPress: () -> Unit) {
         ui.post {
-            if (bubble != null) return@post          // already showing
+            if (bubble != null) return@post
             onBubbleTap = onTap
             onBubbleLongPress = onLongPress
 
@@ -97,7 +109,6 @@ class TapService : AccessibilityService() {
                 background = GradientDrawable().apply { shape = GradientDrawable.OVAL }
             }
 
-            // ★ TYPE_ACCESSIBILITY_OVERLAY — visible over FLAG_SECURE windows ★
             val lp = WindowManager.LayoutParams(
                 size, size,
                 WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,

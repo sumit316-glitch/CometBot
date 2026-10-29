@@ -15,9 +15,8 @@ import android.view.WindowManager
 import kotlin.math.hypot
 
 /**
- * Foreground service: screen capture + detector + tap dispatch.
- * The floating bubble is now owned by TapService (TYPE_ACCESSIBILITY_OVERLAY)
- * so it always shows over FLAG_SECURE banking apps.
+ * Foreground service: screen capture + detector + slash dispatch.
+ * Floating bubble is managed by TapService (TYPE_ACCESSIBILITY_OVERLAY).
  */
 class BotService : Service() {
 
@@ -60,7 +59,6 @@ class BotService : Service() {
         wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         startCapture()
 
-        // Ask TapService to show the bubble (TYPE_ACCESSIBILITY_OVERLAY)
         val svc = TapService.instance
         if (svc != null) {
             svc.showBubble(
@@ -125,7 +123,6 @@ class BotService : Service() {
                 if (!active) return@setOnImageAvailableListener
                 val pl = img.planes[0]
                 val bb = pl.buffer
-                // Skip all-black frames (FLAG_SECURE screen — no point tapping)
                 if (isBlackFrame(bb)) return@setOnImageAvailableListener
                 if (buf.size != bb.remaining()) buf = ByteArray(bb.remaining())
                 bb.get(buf)
@@ -159,7 +156,7 @@ class BotService : Service() {
             var tr = tracks.minByOrNull { hypot(it.x - c.hx, it.y - c.hy) }
             if (tr != null && hypot(tr.x - c.hx, tr.y - c.hy) > 0.25f * capW) tr = null
             if (tr == null) {
-                tr = Track(c.hx, c.hy, 0f, now, 0L); tracks.add(tr)
+                tr = Track(c.hx, c.hy, 700f, now, 0L); tracks.add(tr)
             } else {
                 val dt = (now - tr.t) / 1000f
                 if (dt > 0.005f) {
@@ -168,16 +165,25 @@ class BotService : Service() {
                 }
                 tr.x = c.hx; tr.y = c.hy; tr.t = now
             }
-            if (now - tr.lastTap < 220) continue
-            val ty = c.hy - 0.08f * c.h + tr.vy.coerceIn(0f, 2500f) * 0.09f
-            val safe = res.skulls.none { hypot(it.cx - c.hx, it.cy - ty) < 1.25f * res.skullR }
+            if (now - tr.lastTap < 180) continue
+
+            // Realistic 30ms lead time centered on the comet head
+            val vy = tr.vy.coerceIn(400f, 1500f)
+            val ty = c.hy + vy * 0.030f
+
+            // Boundary checks: don't slash off top score badge or bottom planet surface
+            if (ty < capH * 0.08f || ty > capH * 0.88f) continue
+
+            // Never slash near a skull / bomb
+            val safe = res.skulls.none { hypot(it.cx - c.hx, it.cy - ty) < 1.45f * res.skullR }
             if (!safe) continue
+
             tr.lastTap = now
             out.add(floatArrayOf(c.hx * scaleX, ty * scaleY))
         }
         if (out.isNotEmpty()) {
             val svc = TapService.instance
-            if (svc != null && svc.tap(out)) {
+            if (svc != null && svc.slash(out)) {
                 taps += out.size
                 val t = taps
                 ui.post { TapService.instance?.updateBubble(active, t) }

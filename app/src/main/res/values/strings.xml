@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Comet Bot</string>
+    <string name="a11y_desc">Lets Comet Bot perform taps on the screen while the auto-player is running.</string>
+</resources>
